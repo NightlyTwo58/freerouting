@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "command": "java -jar C:\\Users\\xuena\\Downloads\\freerouting.jar -de C:\\Users\\xuena\\OneDrive\\Documents\\GitHub\\freerouting\\PCBBenchmarks-master\\bm9",
+      "mean": 8.540435318,
+      "stddev": null,
+      "median": 8.540435318,
+      "user": 13.6215625,
+      "system": 2.4165625,
+      "min": 8.540435318,
+      "max": 8.540435318,
+      "times": [
+        8.540435318
+      ],
+      "memory_usage_byte": [
+        0
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

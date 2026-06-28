@@ -34,6 +34,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
+import java.util.HashSet;
 
 /**
  * Class for auto-routing an incomplete connection via a maze search algorithm.
@@ -67,6 +68,10 @@ public class MazeSearchAlgo {
    */
   private ExpandableObject destination_door;
   private int section_no_of_destination_door;
+
+  // stores nets that physically blocked expansion
+  private final Set<Integer> blocking_nets = new TreeSet<>();
+  private final Set<Item> blocking_items = new HashSet<>();
 
   /**
    * Creates a new instance of MazeSearchAlgo
@@ -108,6 +113,10 @@ public class MazeSearchAlgo {
     };
     destination_distance = new DestinationDistance(ctrl.trace_costs, ctrl.layer_active, ctrl.min_normal_via_cost,
         ctrl.min_cheap_via_cost);
+  }
+
+  public Set<Integer> getBlockingNets() {
+    return blocking_nets;
   }
 
   /**
@@ -462,12 +471,14 @@ public class MazeSearchAlgo {
                     true);
                 new_element.ripup_cost = (int) ripup_costs;
                 this.maze_expansion_list.add(new_element);
+                recordBlockingItem(obstacle_room.get_item());
               }
               return something_expanded;
             }
           }
         }
         if (!room_rippable) {
+          recordBlockingItem(obstacle_room.get_item());
           return true;
         }
       }
@@ -1056,11 +1067,13 @@ public class MazeSearchAlgo {
       }
       Item curr_obstacle_item = room.get_item();
       if (!(curr_obstacle_item instanceof Via)) {
+        recordBlockingItem(curr_obstacle_item);
         return;
       }
       Padstack curr_obstacle_padstack = ((Via) curr_obstacle_item).get_padstack();
       if (!this.ctrl.via_rule.contains_padstack(curr_obstacle_padstack)
           || curr_obstacle_item.clearance_class_no() != this.ctrl.via_clearance_class) {
+        recordBlockingItem(curr_obstacle_item);
         return;
       }
       via_lower_bound = curr_obstacle_padstack.from_layer();
@@ -1344,6 +1357,29 @@ public class MazeSearchAlgo {
       obstacle_half_width = 0;
     }
     return obstacle_half_width >= this.ctrl.compensated_trace_half_width[layer];
+  }
+
+  /**
+   * Records the nets of {@code p_item} into {@link #blocking_nets}.
+   *
+   * <p>Called whenever the maze expansion is definitively stopped by an item
+   * that belongs to a foreign net and that we cannot (or have decided not to)
+   * rip up at the current budget.  The scheduler uses this set after the
+   * search finishes to know which nets to wake when they are rerouted.
+   *
+   * <p>Complexity: O(net_count) per call, always ≤ 2 for normal traces/vias.
+   * No board traversal, no extra allocation beyond the TreeSet entry.
+   */
+  private void recordBlockingItem(Item p_item) {
+    if (p_item == null) {
+      return;
+    }
+    for (int i = 0; i < p_item.net_count(); i++) {
+      int net = p_item.get_net_no(i);
+      if (net != this.ctrl.net_no) {   // never blame ourselves
+        blocking_nets.add(net);
+      }
+    }
   }
 
   /**

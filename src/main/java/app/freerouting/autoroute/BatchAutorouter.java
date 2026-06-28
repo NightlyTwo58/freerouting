@@ -424,13 +424,17 @@ public class BatchAutorouter extends NamedAlgorithm {
   /**
    * Auto-routes one ripup pass of all items of the board. Returns false, if the
    * board is already completely routed.
+   *   <li>Ripup costs are raised adaptively for nets that fail repeatedly and
+   *       decay back toward the base cost on success.</li>
+   *   <li>When a net succeeds and has dependents waiting on it, those
+   *       dependents are woken (marked dirty) immediately.</li>
+   * Returns false if the board is already completely routed.
    */
   private boolean autoroute_pass(int p_pass_no) {
     long passStartTime = System.currentTimeMillis();
     try {
       List<Item> autoroute_item_list = getAutorouteItems(this.board);
 
-      // If there are no items to route, we're done
       if (autoroute_item_list.isEmpty()) {
         this.air_line = null;
         return false;
@@ -454,10 +458,9 @@ public class BatchAutorouter extends NamedAlgorithm {
       tempDrc.calculateAllIncompletes();
       routerCounters.incompleteCount = tempDrc.getIncompleteCount();
 
-      // Log incomplete details for debugging
       if (routerCounters.incompleteCount > 0) {
         job.logDebug("Pass #" + p_pass_no + ": " + routerCounters.incompleteCount + " incompletes across "
-            + items_to_go_count + " items to route");
+                + items_to_go_count + " items to route");
         for (int netNo = 1; netNo <= board.rules.nets.max_net_no(); netNo++) {
           int netIncompletes = tempDrc.getIncompleteCount(netNo);
           if (netIncompletes > 0) {
@@ -470,162 +473,144 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       this.fireBoardUpdatedEvent(stats, routerCounters, this.board);
 
-      // TODO: Start mutliple instances of the following part in parallel, wait for
-      // the results and keep the best one
+      // CDCL conflict-aware scheduler.  Lives for the duration of this
+      // pass.  The base cost is p_pass_no * start_ripup_costs; the
+      // scheduler multiplies this further for repeatedly-failing nets.
+      int passBaseRipupCost = this.start_ripup_costs * p_pass_no;
+      ConflictAwareRetryScheduler conflictScheduler =
+              new ConflictAwareRetryScheduler(passBaseRipupCost);
 
-      // Sort items by airline distance (shortest first) for deterministic routing
-      // This prioritizes local connections which typically route faster
-      // NOTE: Disabled in v2.3 because it negatively impacts convergence compared to
-      // v1.9 (natural order)
-      // autoroute_item_list.sort(Comparator.comparingDouble(this::calculateItemDistance));
-
-      // Let's go through all items to route
       for (Item curr_item : autoroute_item_list) {
-        // If the user requested to stop the auto-router, we stop it
         if (this.thread.is_stop_auto_router_requested()) {
           break;
         }
 
-        // Let's go through all nets of this item
         for (int i = 0; i < curr_item.net_count(); i++) {
-          // If the user requested to stop the auto-router, we stop it
           if (this.thread.is_stop_auto_router_requested()) {
             break;
           }
 
           if (this.settings.maxItems != null && this.totalItemsRouted >= this.settings.maxItems) {
             job.logInfo("Max items limit reached (" + this.settings.maxItems + "). Stopping auto-router.");
-            // Call requestStop() (sets ALL) instead of request_stop_auto_router() (sets
-            // AUTO_ROUTER_ONLY) so the optimization stage is also skipped.  maxItems is a
-            // debugging/test ceiling meant to bound the entire routing job; running the
-            // optimizer on a deliberately-incomplete board is not useful and prevents the
-            // process from terminating promptly.
             this.thread.requestStop();
             break;
           }
           this.totalItemsRouted++;
 
-          // We visually mark the area of the board, which is changed by the auto-router
+          int currNetNo = curr_item.get_net_no(i);
+
+          // CDCL skip: if this net has failed before and nothing on its
+          // path has changed, skip and count it as not-routed without spending
+          // maze-search time.
+          if (conflictScheduler.shouldSkip(currNetNo)) {
+            ++not_routed;
+            --items_to_go_count;
+            continue;
+          }
+
           board.start_marking_changed_area();
 
-          // Do the auto-routing step for this item (typically PolylineTrace or Pin)
-          // Use a fresh set per item to mirror v1.9 behavior and avoid cross-item side effects.
           SortedSet<Item> ripped_item_list = new TreeSet<>();
           Map<Item, Integer> ripped_item_costs = new LinkedHashMap<>();
-          int netItemsBefore = board.get_connectable_items(curr_item.get_net_no(i)).size();
+          int netItemsBefore = board.get_connectable_items(currNetNo).size();
           PerformanceProfiler.start("autoroute_item");
-          var autorouterResult = autoroute_item(curr_item, curr_item.get_net_no(i), ripped_item_list, ripped_item_costs, p_pass_no);
+
+          // Obtain the adaptive ripup cost for this net from the scheduler.
+          int adaptiveRipupCost = conflictScheduler.getRipupCost(currNetNo, passBaseRipupCost);
+          
+          var autorouterResult = autoroute_item(
+                  curr_item, currNetNo, ripped_item_list, ripped_item_costs,
+                  p_pass_no, adaptiveRipupCost);
+
           PerformanceProfiler.end("autoroute_item");
+
+          // Inform the scheduler about the outcome.
+          if (autorouterResult.state == AutorouteAttemptState.ROUTED) {
+            conflictScheduler.recordSuccess(currNetNo);
+
+            // Any net that was ripped in order to place this one now has
+            // its environment changed — mark those nets dirty so they get
+            // retried.
+            for (Item rippedItem : ripped_item_list) {
+              for (int netIx = 0; netIx < rippedItem.net_count(); netIx++) {
+                conflictScheduler.markDirty(rippedItem.get_net_no(netIx));
+              }
+            }
+          } else if (autorouterResult.state == AutorouteAttemptState.FAILED) {
+            conflictScheduler.recordFailure(currNetNo, autorouterResult.blockingNets);
+          }
+          // ALREADY_CONNECTED / SKIPPED / NO_UNCONNECTED_NETS states
+          // require no scheduler action.
+
+          // Existing logging / counters (unchanged from original)
           if (!ripped_item_list.isEmpty()) {
             for (Item rippedItem : ripped_item_list) {
               StringBuilder rippedNets = new StringBuilder();
               for (int netIx = 0; netIx < rippedItem.net_count(); netIx++) {
-                if (netIx > 0) {
-                  rippedNets.append('|');
-                }
+                if (netIx > 0) rippedNets.append('|');
                 rippedNets.append(rippedItem.get_net_no(netIx));
               }
               int ripupCost = ripped_item_costs.getOrDefault(rippedItem, -1);
               FRLogger.trace(
-                  "BatchAutorouter.autoroute_pass",
-                  "compare_trace_ripped_item",
-                  "source_item=" + curr_item.get_id_no()
-                      + ", source_net=" + curr_item.get_net_no(i)
-                      + ", ripped_id=" + rippedItem.get_id_no()
-                      + ", ripped_type=" + rippedItem.getClass().getSimpleName()
-                      + ", ripped_net_count=" + rippedItem.net_count()
-                      + ", ripped_nets=" + rippedNets
-                      + ", ripup_cost=" + ripupCost,
-                  "Net #" + curr_item.get_net_no(i) + ",Item #" + curr_item.get_id_no(),
-                  getImpactedPoints(rippedItem));
+                      "BatchAutorouter.autoroute_pass",
+                      "compare_trace_ripped_item",
+                      "source_item=" + curr_item.get_id_no()
+                              + ", source_net=" + currNetNo
+                              + ", ripped_id=" + rippedItem.get_id_no()
+                              + ", ripped_type=" + rippedItem.getClass().getSimpleName()
+                              + ", ripped_net_count=" + rippedItem.net_count()
+                              + ", ripped_nets=" + rippedNets
+                              + ", ripup_cost=" + ripupCost,
+                      "Net #" + currNetNo + ",Item #" + curr_item.get_id_no(),
+                      getImpactedPoints(rippedItem));
             }
           }
+
           if (FRLogger.isTraceEnabled()) {
             DesignRulesChecker innerDrc = new DesignRulesChecker(board, null);
             innerDrc.calculateAllIncompletes();
             int tempIncomp = innerDrc.getIncompleteCount();
-            int tempNetIncomp = innerDrc.getIncompleteCount(curr_item.get_net_no(i));
-            int netItemsAfter = board.get_connectable_items(curr_item.get_net_no(i)).size();
+            int tempNetIncomp = innerDrc.getIncompleteCount(currNetNo);
+            int netItemsAfter = board.get_connectable_items(currNetNo).size();
             int maxItemId = board.communication.id_no_generator.max_generated_no();
             FRLogger.trace(
-                "BatchAutorouter.autoroute_pass",
-                "compare_trace_route_item",
-                "Routing " + curr_item.getClass().getSimpleName() + " -> result=" + autorouterResult.state
-                    + ", details=" + autorouterResult.details
-                    + ", incompletes=" + tempIncomp + ", netIncomplete=" + tempNetIncomp
-                    + ", ripped=" + ripped_item_list.size() + ", netItems="
-                    + netItemsBefore + "->" + netItemsAfter
-                    + ", maxItemId=" + maxItemId,
-                "Net #" + curr_item.get_net_no(i) + ",Item #" + curr_item.get_id_no() + ",Type="
-                    + curr_item.getClass().getSimpleName(),
-                getImpactedPoints(curr_item));
-          }
-
-          if (curr_item.get_net_no(i) == 94) {
-            FRLogger.trace(
-                "BatchAutorouter.autoroute_pass",
-                "compare_trace_dump_net_items",
-                "Dump net 94 items",
-                "Net #94",
-                new Point[0]);
-            for (Item nItem : board.get_connectable_items(94)) {
-              if (nItem instanceof Trace) {
-                Trace t = (Trace) nItem;
-                FRLogger.trace(
                     "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Trace layer=" + t.get_layer() + " corners=" + t.first_corner() + " to " + t.last_corner(),
-                    "Net #94,Item #" + t.get_id_no() + ",Type=Trace",
-                    new Point[] { t.first_corner(), t.last_corner() });
-              } else if (nItem instanceof Via) {
-                Via v = (Via) nItem;
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Via center=" + v.get_center(),
-                    "Net #94,Item #" + v.get_id_no() + ",Type=Via",
-                    new Point[] { v.get_center() });
-              } else if (nItem instanceof Pin) {
-                Pin p = (Pin) nItem;
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Pin center=" + p.get_center() + " name=" + p.name() + " comp=" + p.component_name(),
-                    "Net #94,Item #" + p.get_id_no() + ",Type=Pin",
-                    new Point[] { p.get_center() });
-              } else {
-                FRLogger.trace(
-                    "BatchAutorouter.autoroute_pass",
-                    "compare_trace_dump_net_item",
-                    "Item " + nItem.getClass().getSimpleName(),
-                    "Net #94,Item #" + nItem.get_id_no() + ",Type=" + nItem.getClass().getSimpleName(),
-                    getImpactedPoints(nItem));
-              }
-            }
+                    "compare_trace_route_item",
+                    "Routing " + curr_item.getClass().getSimpleName()
+                            + " -> result=" + autorouterResult.state
+                            + ", details=" + autorouterResult.details
+                            + ", incompletes=" + tempIncomp
+                            + ", netIncomplete=" + tempNetIncomp
+                            + ", ripped=" + ripped_item_list.size()
+                            + ", netItems=" + netItemsBefore + "->" + netItemsAfter
+                            + ", maxItemId=" + maxItemId
+                            + ", adaptiveRipupCost=" + adaptiveRipupCost
+                            + ", conflictFailures=" + conflictScheduler.getFailureCount(currNetNo),
+                    "Net #" + currNetNo + ",Item #" + curr_item.get_id_no()
+                            + ",Type=" + curr_item.getClass().getSimpleName(),
+                    getImpactedPoints(curr_item));
           }
 
           if (autorouterResult.state == AutorouteAttemptState.ROUTED) {
-            // The item was successfully routed
             ++routed;
           } else if ((autorouterResult.state == AutorouteAttemptState.ALREADY_CONNECTED)
-              || (autorouterResult.state == AutorouteAttemptState.NO_UNCONNECTED_NETS)
-              || (autorouterResult.state == AutorouteAttemptState.CONNECTED_TO_PLANE)) {
-            // The item doesn't need to be routed
+                  || (autorouterResult.state == AutorouteAttemptState.NO_UNCONNECTED_NETS)
+                  || (autorouterResult.state == AutorouteAttemptState.CONNECTED_TO_PLANE)) {
             ++skipped;
           } else {
-            Net net = board.rules.nets.get(curr_item.get_net_no(i));
-            String netName = (net != null) ? net.name : "net#" + curr_item.get_net_no(i);
-
-            // Record the failure
+            Net net = board.rules.nets.get(currNetNo);
+            String netName = (net != null) ? net.name : "net#" + currNetNo;
             board.failureLog.recordFailure(curr_item, p_pass_no, autorouterResult.state, autorouterResult.details);
-
             job.logDebug("Autorouter " + autorouterResult.details);
-            // Log details when we're down to last few items or item has many failures
             int failureCount = board.failureLog.getFailureCount(curr_item);
             if (items_to_go_count <= 5 || failureCount >= 3) {
-              job.logDebug("Pass #" + p_pass_no + ": Failed to route " + curr_item.getClass().getSimpleName()
-                  + " on net '" + netName + "' (" + items_to_go_count + " items remaining, "
-                  + failureCount + " failures). State: " + autorouterResult.state);
+              job.logDebug("Pass #" + p_pass_no + ": Failed to route "
+                      + curr_item.getClass().getSimpleName()
+                      + " on net '" + netName + "' (" + items_to_go_count
+                      + " items remaining, " + failureCount + " failures, "
+                      + "CDCL failures=" + conflictScheduler.getFailureCount(currNetNo)
+                      + ", blockers=" + conflictScheduler.getBlockers(currNetNo)
+                      + "). State: " + autorouterResult.state);
             }
             ++not_routed;
           }
@@ -646,13 +631,15 @@ public class BatchAutorouter extends NamedAlgorithm {
         }
       }
 
+      FRLogger.debug("CDCL pass #" + p_pass_no + " summary: " + conflictScheduler);
+
       int incompletesBefore = calculateIncompleteCount(board);
       FRLogger.trace(
-          "BatchAutorouter.autoroute_pass",
-          "compare_trace_remove_tails",
-          "Incompletes before remove_tails=" + incompletesBefore,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+              "BatchAutorouter.autoroute_pass",
+              "compare_trace_remove_tails",
+              "Incompletes before remove_tails=" + incompletesBefore,
+              "Autorouter pass #" + p_pass_no,
+              new Point[0]);
 
       if (this.remove_unconnected_vias) {
         remove_tails(Item.StopConnectionOption.NONE);
@@ -662,13 +649,12 @@ public class BatchAutorouter extends NamedAlgorithm {
 
       int incompletesAfter = calculateIncompleteCount(board);
       FRLogger.trace(
-          "BatchAutorouter.autoroute_pass",
-          "compare_trace_remove_tails",
-          "Incompletes after remove_tails=" + incompletesAfter,
-          "Autorouter pass #" + p_pass_no,
-          new Point[0]);
+              "BatchAutorouter.autoroute_pass",
+              "compare_trace_remove_tails",
+              "Incompletes after remove_tails=" + incompletesAfter,
+              "Autorouter pass #" + p_pass_no,
+              new Point[0]);
 
-      // Fire final update for this pass
       BoardStatistics boardStatistics = board.get_statistics();
       routerCounters.passCount = p_pass_no;
       routerCounters.queuedToBeRoutedCount = items_to_go_count;
@@ -680,10 +666,8 @@ public class BatchAutorouter extends NamedAlgorithm {
       this.fireBoardUpdatedEvent(boardStatistics, routerCounters, this.board);
 
       long passDuration = System.currentTimeMillis() - passStartTime;
-      int currentRipupCost = this.start_ripup_costs * p_pass_no;
-      PerformanceProfiler.recordPass(p_pass_no, routerCounters.incompleteCount, passDuration, currentRipupCost);
+      PerformanceProfiler.recordPass(p_pass_no, routerCounters.incompleteCount, passDuration, passBaseRipupCost);
 
-      // We are done with this pass
       this.air_line = null;
       return routed > 0 || not_routed > 0;
     } catch (Exception e) {
@@ -1240,20 +1224,31 @@ public class BatchAutorouter extends NamedAlgorithm {
         TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
   }
 
+  private AutorouteAttemptResult autoroute_item(
+          Item p_item, int p_route_net_no,
+          SortedSet<Item> p_ripped_item_list,
+          Map<Item, Integer> p_ripup_costs,
+          int p_ripup_pass_no) {
+    int defaultCost = this.start_ripup_costs * p_ripup_pass_no;
+    return autoroute_item(p_item, p_route_net_no, p_ripped_item_list,
+            p_ripup_costs, p_ripup_pass_no, defaultCost);
+  }
+
   // Tries to route an item on a specific net. Returns true, if the item is
   // routed.
-  private AutorouteAttemptResult autoroute_item(Item p_item, int p_route_net_no, SortedSet<Item> p_ripped_item_list,
-      Map<Item, Integer> p_ripup_costs, int p_ripup_pass_no) {
+  private AutorouteAttemptResult autoroute_item(
+          Item p_item, int p_route_net_no,
+          SortedSet<Item> p_ripped_item_list,
+          Map<Item, Integer> p_ripup_costs,
+          int p_ripup_pass_no,
+          int p_ripup_cost) {
     try {
       boolean contains_plane = false;
-
-      // Get the net
       Net route_net = board.rules.nets.get(p_route_net_no);
       if (route_net != null) {
         contains_plane = route_net.contains_plane();
       }
 
-      // Get the current via costs based on auto-router settings
       int curr_via_costs;
       if (contains_plane) {
         curr_via_costs = this.settings.get_plane_via_costs();
@@ -1261,15 +1256,13 @@ public class BatchAutorouter extends NamedAlgorithm {
         curr_via_costs = this.settings.get_via_costs();
       }
 
-      // Get and calculate the auto-router settings based on the board and net we are
-      // working on
-      AutorouteControl autoroute_control = new AutorouteControl(this.board, p_route_net_no, settings, curr_via_costs,
-          this.trace_cost_arr);
+      AutorouteControl autoroute_control = new AutorouteControl(
+              this.board, p_route_net_no, settings, curr_via_costs, this.trace_cost_arr);
       autoroute_control.ripup_allowed = true;
-      autoroute_control.ripup_costs = this.start_ripup_costs * p_ripup_pass_no;
+      // Use the caller-supplied adaptive cost instead of the flat pass formula.
+      autoroute_control.ripup_costs = p_ripup_cost;
       autoroute_control.remove_unconnected_vias = this.remove_unconnected_vias;
 
-      // Check if the item is already routed
       Set<Item> unconnected_set = p_item.get_unconnected_set(p_route_net_no);
       if (unconnected_set.isEmpty()) {
         return new AutorouteAttemptResult(AutorouteAttemptState.NO_UNCONNECTED_NETS);
@@ -1293,30 +1286,30 @@ public class BatchAutorouter extends NamedAlgorithm {
         route_dest_set = connected_set;
       }
 
-      // Calculate the shortest distance between the two sets of items
       calc_airline(route_start_set, route_dest_set);
 
-      // Calculate the maximum time for this autoroute pass
       double max_milliseconds = 100000 * Math.pow(2, p_ripup_pass_no - 1);
       max_milliseconds = Math.min(max_milliseconds, Integer.MAX_VALUE);
       TimeLimit time_limit = new TimeLimit((int) max_milliseconds);
 
-      // Initialize the auto-router engine
-      AutorouteEngine autoroute_engine = board.init_autoroute(p_route_net_no,
-          autoroute_control.trace_clearance_class_no, this.thread, time_limit, this.retain_autoroute_database);
+      AutorouteEngine autoroute_engine = board.init_autoroute(
+              p_route_net_no, autoroute_control.trace_clearance_class_no,
+              this.thread, time_limit, this.retain_autoroute_database);
 
-      // Do the auto-routing between the two sets of items
-      AutorouteAttemptResult autoroute_result = autoroute_engine.autoroute_connection(route_start_set, route_dest_set,
-          autoroute_control, p_ripped_item_list, p_ripup_costs);
+      AutorouteAttemptResult autoroute_result = autoroute_engine.autoroute_connection(
+              route_start_set, route_dest_set, autoroute_control,
+              p_ripped_item_list, p_ripup_costs);
 
-      // Update the changed area of the board
       if (autoroute_result.state == AutorouteAttemptState.ROUTED) {
         int maxItemIdBeforeOpt = board.communication.id_no_generator.max_generated_no();
-        FRLogger.trace("compare_trace_opt_changed_area_before net=" + p_route_net_no + ", maxItemId=" + maxItemIdBeforeOpt);
-        board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy, autoroute_control.trace_costs,
-            this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
+        FRLogger.trace("compare_trace_opt_changed_area_before net=" + p_route_net_no
+                + ", maxItemId=" + maxItemIdBeforeOpt);
+        board.opt_changed_area(new int[0], null, this.trace_pull_tight_accuracy,
+                autoroute_control.trace_costs, this.thread, TIME_LIMIT_TO_PREVENT_ENDLESS_LOOP);
         int maxItemIdAfterOpt = board.communication.id_no_generator.max_generated_no();
-        FRLogger.trace("compare_trace_opt_changed_area_after net=" + p_route_net_no + ", maxItemId=" + maxItemIdAfterOpt + ", delta=" + (maxItemIdAfterOpt - maxItemIdBeforeOpt));
+        FRLogger.trace("compare_trace_opt_changed_area_after net=" + p_route_net_no
+                + ", maxItemId=" + maxItemIdAfterOpt
+                + ", delta=" + (maxItemIdAfterOpt - maxItemIdBeforeOpt));
       }
 
       return autoroute_result;

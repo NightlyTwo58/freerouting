@@ -1,0 +1,43 @@
+Run benchmark
+
+.\benchmark.ps1 `
+    -Jar .\freerouting-test.jar `
+    -Root "C:\Users\xuena\OneDrive\Documents\GitHub\freerouting\PCBBenchmarks-master"
+
+OR
+.\benchmark.ps1 -Jar "C:\Users\xuena\OneDrive\Documents\GitHub\freerouting\build\libs\freerouting.jar" -Root "C:\Users\xuena\OneDrive\Documents\GitHub\freerouting\PCBBenchmarks-master"
+
+
+export to CSV
+
+hyperfine `
+  --warmup 2 `
+  --runs 5 `
+  --export-csv results.csv `
+  'java -jar freerouting-test.jar -de board.dsn -do out.ses --gui.enabled=false'
+
+OR
+--export-json results.json
+
+
+MODIFIED, ROUTING ORDERING (idea 1)
+2026-06-25 13:48:03.887 INFO   [34DC2E\1178C4] Auto-router session completed: started with 195 unrouted nets, completed in 1 minute 41.14 seconds, final score: 999.92, using 96.70 total CPU seconds, 132.15 GB total allocated, and 1186.09 MB peak heap usage.
+22 passes
+
+
+UNMODIFIED
+2026-06-25 13:52:00.510 INFO   [C4EF36\EF0EBF] Auto-router session completed: started with 195 unrouted nets, completed in 1 minute 17.56 seconds, final score: 999.92, using 74.56 total CPU seconds, 76.37 GB total allocated, and 1377.76 MB peak heap usage.
+13 passes
+
+MODIFIED, CDCL (Adaptive retrying, idea 2)
+2026-06-27 18:01:38.054 INFO   [AC27A3\22510D] Auto-router session completed: started with 195 unrouted nets, completed in 1 minute 1.03 seconds, final score: 999.92, using 58.47 total CPU seconds, 64.05 GB total allocated, and 841.56 MB peak heap usage.
+20 fanout passes; 9 auto-router passes
+
+UNMODIFIED ATTEMPT 2
+2026-06-27 18:50:52.489 INFO   [618ADE\992A4B] Auto-router session completed: started with 195 unrouted nets, completed in 1 minute 31.55 seconds, final score: 999.92, using 85.63 total CPU seconds, 75.67 GB total allocated, and 935.16 MB peak heap usage.13 
+
+20 fanout passes, 13 auto-router passes
+
+list of files modified: autorouteattemptresult, autorouteengine, BatchAutorouter, ConflictAwareRetryScheduler (new), MazeSearchAlgo
+
+2026-06-27 18:22:24.874 INFO   [3C195F\452E37] Auto-router session completed: started with 195 unrouted nets, completed in 42.43 seconds, final score: 994.58.

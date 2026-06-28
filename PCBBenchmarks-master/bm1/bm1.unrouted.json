@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "command": "java -jar C:\\Users\\xuena\\Downloads\\freerouting.jar -de C:\\Users\\xuena\\OneDrive\\Documents\\GitHub\\freerouting\\PCBBenchmarks-master\\bm1\\bm1.unrouted.dsn -do C:\\Users\\xuena\\OneDrive\\Documents\\GitHub\\freerouting\\PCBBenchmarks-master\\bm1\\bm1.unrouted.ses --gui.enabled=false",
+      "mean": 36.00026743,
+      "stddev": null,
+      "median": 36.00026743,
+      "user": 104.371875,
+      "system": 3.480625,
+      "min": 36.00026743,
+      "max": 36.00026743,
+      "times": [
+        36.00026743
+      ],
+      "memory_usage_byte": [
+        0
+      ],
+      "exit_codes": [
+        0
+      ]
+    }
+  ]
+}

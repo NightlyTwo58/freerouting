@@ -1,4 +1,5 @@
 package app.freerouting.autoroute;
+import java.util.Collections;
 
 import app.freerouting.board.Item;
 import app.freerouting.board.RoutingBoard;
@@ -146,7 +147,7 @@ public class AutorouteEngine {
     if (maze_search_algo == null) {
       return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
           "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because the maze search algorithm could not be created.");
+              + ", because the maze search algorithm could not be created.", Collections.emptySet());
     }
 
     MazeSearchAlgo.Result search_result = null;
@@ -189,25 +190,40 @@ public class AutorouteEngine {
     }
 
     if (search_result == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
-          "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because no connection was found between their nets.");
+      return new AutorouteAttemptResult(
+              AutorouteAttemptState.FAILED,
+              "Failed to route connection between " + sourceItems + " and " + targetItems
+                      + ", because no connection was found between their nets.",
+              maze_search_algo.getBlockingNets()
+      );
     }
 
     if (autoroute_result == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
-          "Failed to route connection between " + sourceItems + " and " + targetItems + ".");
+      return new AutorouteAttemptResult(
+              AutorouteAttemptState.FAILED,
+              "Failed to route connection between " + sourceItems + " and " + targetItems + ".",
+              Collections.emptySet()
+      );
     }
 
     if (!p_ctrl.layer_active[autoroute_result.start_layer] || !p_ctrl.layer_active[autoroute_result.target_layer]) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED, "Failed to route connection between "
-          + sourceItems + " and " + targetItems + ", because some of their layers are disabled.");
+      return new AutorouteAttemptResult(
+              AutorouteAttemptState.FAILED,
+              "Failed to route connection between "
+                      + sourceItems + " and " + targetItems
+                      + ", because some of their layers are disabled.",
+              Collections.emptySet()
+      );
     }
 
     if (autoroute_result.connection_items == null) {
       FRLogger.debug("AutorouteEngine.autoroute_connection: result_items != null expected");
-      return new AutorouteAttemptResult(AutorouteAttemptState.SKIPPED,
-          "No new connections were made between " + sourceItems + " and " + targetItems + ".");
+      return new AutorouteAttemptResult(
+              AutorouteAttemptState.SKIPPED,
+              "No new connections were made between "
+                      + sourceItems + " and " + targetItems + ".",
+              Collections.emptySet()
+      );
     }
 
     // Delete the ripped connections.
@@ -245,12 +261,16 @@ public class AutorouteEngine {
       this.board.end_notify_observers();
     }
     if (insert_found_connection_algo == null) {
-      return new AutorouteAttemptResult(AutorouteAttemptState.FAILED,
-          "Failed to route connection between " + sourceItems + " and " + targetItems
-              + ", because the new connection could not be inserted.");
+      return new AutorouteAttemptResult(
+              AutorouteAttemptState.FAILED,
+              "Failed to route connection between "
+                      + sourceItems + " and " + targetItems
+                      + ", because the new connection could not be inserted.",
+              Collections.emptySet()
+      );
     }
 
-    return new AutorouteAttemptResult(AutorouteAttemptState.ROUTED);
+    return new AutorouteAttemptResult(AutorouteAttemptState.ROUTED,Collections.emptySet());
   }
 
   /**

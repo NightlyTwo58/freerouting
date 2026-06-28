@@ -31,11 +31,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
-import java.util.Collection;
-import java.util.Iterator;
-import java.util.Set;
-import java.util.SortedSet;
-import java.util.TreeSet;
+import java.util.*;
 
 /**
  * The class that represents the board that is being routed. It contains all the
@@ -928,7 +924,7 @@ public class RoutingBoard extends BasicBoard implements Serializable {
       Stoppable p_stoppable_thread, TimeLimit p_time_limit) {
     if (!(p_item instanceof Connectable) || p_item.net_count() == 0) {
       return new AutorouteAttemptResult(AutorouteAttemptState.NO_CONNECTIONS,
-          "The item '" + p_item + "' is not connectable.");
+          "The item '" + p_item + "' is not connectable.", Collections.emptySet());
     }
     if (p_item.net_count() > 1) {
       FRLogger.warn("RoutingBoard.autoroute: net_count > 1 not yet implemented");
@@ -943,14 +939,14 @@ public class RoutingBoard extends BasicBoard implements Serializable {
       for (Item curr_item : route_start_set) {
         if (curr_item instanceof ConductionArea) {
           return new AutorouteAttemptResult(AutorouteAttemptState.CONNECTED_TO_PLANE,
-              "The item '" + curr_item + "' is connected to a plane.");
+              "The item '" + curr_item + "' is connected to a plane.", Collections.emptySet());
         }
       }
     }
     Set<Item> route_dest_set = p_item.get_unconnected_set(route_net_no);
     if (route_dest_set.isEmpty()) {
       return new AutorouteAttemptResult(AutorouteAttemptState.ALREADY_CONNECTED,
-          "The item '" + p_item + "' is already connected.");
+          "The item '" + p_item + "' is already connected.", Collections.emptySet());
     }
     SortedSet<Item> ripped_item_list = new TreeSet<>();
     AutorouteEngine curr_autoroute_engine = init_autoroute(p_item.get_net_no(0), ctrl_settings.trace_clearance_class_no,
@@ -975,7 +971,7 @@ public class RoutingBoard extends BasicBoard implements Serializable {
       Stoppable p_stoppable_thread, TimeLimit p_time_limit) {
     if (p_pin.first_layer() != p_pin.last_layer() || p_pin.net_count() != 1) {
       return new AutorouteAttemptResult(AutorouteAttemptState.ALREADY_CONNECTED,
-          "The pin '" + p_pin + "' is already connected.");
+          "The pin '" + p_pin + "' is already connected.", Collections.emptySet());
     }
     int pin_net_no = p_pin.get_net_no(0);
     int pin_layer = p_pin.first_layer();
@@ -983,13 +979,13 @@ public class RoutingBoard extends BasicBoard implements Serializable {
     for (Item curr_item : pin_connected_set) {
       if (curr_item.first_layer() != pin_layer || curr_item.last_layer() != pin_layer) {
         return new AutorouteAttemptResult(AutorouteAttemptState.ALREADY_CONNECTED,
-            "The pin '" + p_pin + "' is already connected.");
+            "The pin '" + p_pin + "' is already connected.", Collections.emptySet());
       }
     }
     Set<Item> unconnected_set = p_pin.get_unconnected_set(pin_net_no);
     if (unconnected_set.isEmpty()) {
       return new AutorouteAttemptResult(AutorouteAttemptState.NO_UNCONNECTED_NETS,
-          "The pin '" + p_pin + "' is already connected.");
+          "The pin '" + p_pin + "' is already connected.", Collections.emptySet());
     }
     app.freerouting.geometry.planar.FloatPoint pin_center = p_pin.get_center().to_float();
     java.util.List<Item> sorted_unconnected_list = new java.util.ArrayList<>(unconnected_set);
@@ -1050,7 +1046,7 @@ public class RoutingBoard extends BasicBoard implements Serializable {
           ctrl_settings, ripped_item_list, null);
     }
     if (result == null) {
-      result = new AutorouteAttemptResult(AutorouteAttemptState.FAILED, "No target items to route connection.");
+      result = new AutorouteAttemptResult(AutorouteAttemptState.FAILED, "No target items to route connection.", Collections.emptySet());
     }
     if (result.state == AutorouteAttemptState.ROUTED) {
       final int time_limit_to_prevent_endless_loop = 1000;
