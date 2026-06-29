@@ -502,7 +502,7 @@ public class BatchAutorouter extends NamedAlgorithm {
           // CDCL skip: if this net has failed before and nothing on its
           // path has changed, skip and count it as not-routed without spending
           // maze-search time.
-          if (conflictScheduler.shouldSkip(currNetNo)) {
+          if (conflictScheduler.shouldSkip(currNetNo, p_pass_no)) {
             ++not_routed;
             --items_to_go_count;
             continue;
@@ -537,7 +537,7 @@ public class BatchAutorouter extends NamedAlgorithm {
               }
             }
           } else if (autorouterResult.state == AutorouteAttemptState.FAILED) {
-            conflictScheduler.recordFailure(currNetNo, autorouterResult.blockingNets);
+            conflictScheduler.recordFailure(currNetNo, autorouterResult.blockingNets, p_pass_no);
           }
           // ALREADY_CONNECTED / SKIPPED / NO_UNCONNECTED_NETS states
           // require no scheduler action.

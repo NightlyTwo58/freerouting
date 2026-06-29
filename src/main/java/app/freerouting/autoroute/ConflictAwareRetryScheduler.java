@@ -5,34 +5,55 @@ import app.freerouting.logger.FRLogger;
 import java.util.*;
 
 /**
- * CDCL-inspired conflict-aware retry scheduler for the batch autorouter.
+ * Conflict-aware retry scheduler for the batch autorouter.
  *
  * <p>Tracks, for each net:
  * <ul>
- *   <li>Which other nets blocked it (its conflict set).</li>
+ *   <li>Which other nets blocked it on its most recent failed attempt (its
+ *       conflict set), and the transpose of that (its dependents).</li>
  *   <li>How many times it has failed consecutively.</li>
- *   <li>Whether anything on its routing path has changed since its last failure
- *       (the "dirty" flag).  A net that is not dirty will produce the same
- *       maze-search result it produced before, so retrying it wastes time.</li>
- *   <li>An adaptive ripup-cost multiplier that rises with repeated failures and
- *       falls back toward 1.0 on success, mimicking VSIDS-style activity decay.</li>
+ *   <li>Whether anything on its routing path has changed since its last
+ *       failure (the "dirty" flag).</li>
+ *   <li>An adaptive ripup-cost multiplier that rises with repeated failures
+ *       and falls back toward 1.0 on success.</li>
  * </ul>
+ *
+ * <p>Conflict information is used to <em>prioritize</em> retries, not to
+ * permanently prune them. A net is deferred for at most
+ * {@link #MAX_SKIP_PASSES} passes even if nothing about its blockers appears
+ * to have changed, and recorded blocker sets age out automatically after
+ * {@link #BLOCKER_MAX_AGE} passes so stale conflict information can't
+ * suppress exploration forever. There is no "learned clause" store: observed
+ * conflicts are evidence about what's likely to fail again, not a logical
+ * guarantee that it will.
  *
  * <p>Usage inside {@code autoroute_pass}:
  * <pre>
  *   ConflictAwareRetryScheduler scheduler = new ConflictAwareRetryScheduler(baseRipupCost);
  *
  *   // on failure:
- *   scheduler.recordFailure(netNo, result.blockingNets);
+ *   scheduler.recordFailure(netNo, result.blockingNets, currentPass);
  *
  *   // on success:
  *   scheduler.recordSuccess(netNo);
  *
- *   // before routing a net decide whether to skip it:
- *   if (scheduler.shouldSkip(netNo)) continue;
+ *   // when a net is ripped up but not yet successfully rerouted:
+ *   scheduler.recordRipped(netNo);
+ *
+ *   // before routing, gate and order the candidate list for this pass:
+ *   List&lt;Integer&gt; toRoute = new ArrayList&lt;&gt;();
+ *   for (int netNo : allNets) {
+ *       if (!scheduler.shouldSkip(netNo, currentPass)) {
+ *           toRoute.add(netNo);
+ *       }
+ *   }
+ *   toRoute.sort(Comparator.comparingInt(scheduler::priority).reversed());
  *
  *   // get the ripup cost to use for this net:
- *   int ripupCost = scheduler.getRipupCost(netNo);
+ *   int ripupCost = scheduler.getRipupCost(netNo, passScale);
+ *
+ *   // once per pass, after routing attempts for the pass are done:
+ *   scheduler.nextPass();
  * </pre>
  */
 public class ConflictAwareRetryScheduler {
@@ -43,19 +64,36 @@ public class ConflictAwareRetryScheduler {
     private static final double MAX_COST_MULTIPLIER = 2.0;
 
     /**
-     * Per-failure cost multiplier growth.  After k consecutive failures the
-     * effective cost multiplier is min(1 + k * COST_GROWTH_PER_FAILURE, MAX).
+     * Per-failure cost multiplier growth factor (multiplicative / exponential
+     * smoothing rather than a flat additive step, so the multiplier doesn't
+     * jump by the same fixed amount whether it's near 1.0 or near the cap).
      * Growth only kicks in after MIN_FAILURES_BEFORE_ESCALATION failures to
      * avoid penalising nets that fail once on a first pass due to ordering.
      */
-    private static final double COST_GROWTH_PER_FAILURE = 0.25;
+    private static final double COST_GROWTH_FACTOR = 1.15;
     private static final int    MIN_FAILURES_BEFORE_ESCALATION = 2;
 
     /**
      * After a net succeeds its multiplier decays toward 1.0 by this factor
-     * (i.e. multiplier *= DECAY_ON_SUCCESS).  Keeps recent history relevant.
+     * (i.e. multiplier = 1.0 + (multiplier - 1.0) * DECAY_ON_SUCCESS).
      */
-    private static final double DECAY_ON_SUCCESS = 0.75;
+    private static final double DECAY_ON_SUCCESS = 0.6;
+
+    /**
+     * A net is never skipped more than this many consecutive passes in a
+     * row, even if none of its recorded blockers appear to have changed.
+     * This guarantees every net eventually gets re-examined, so a stale or
+     * incomplete blocker set can't permanently suppress it.
+     */
+    private static final int MAX_SKIP_PASSES = 2;
+
+    /**
+     * Recorded blocker sets older than this many passes are discarded and
+     * the owning net is marked dirty again, regardless of whether a success
+     * was ever observed for any of its blockers. This bounds how long stale
+     * conflict information can influence scheduling.
+     */
+    private static final int BLOCKER_MAX_AGE = 3;
 
     // Per-net state
 
@@ -63,8 +101,9 @@ public class ConflictAwareRetryScheduler {
     private final Map<Integer, Set<Integer>> blockers = new HashMap<>();
 
     /**
-     * Nets that <em>depend on</em> this net: if this net is rerouted they must
-     * be marked dirty.  This is the transpose of {@link #blockers}.
+     * Nets that <em>depend on</em> this net: if this net is rerouted or
+     * ripped they must be marked dirty. This is the transpose of
+     * {@link #blockers}.
      */
     private final Map<Integer, Set<Integer>> dependents = new HashMap<>();
 
@@ -72,28 +111,27 @@ public class ConflictAwareRetryScheduler {
     private final Map<Integer, Integer> failureCount = new HashMap<>();
 
     /**
-     * Dirty flag: true if the routing environment for this net may have changed
-     * since its last failure.  All nets start dirty (we have no prior
-     * knowledge).  A net is marked clean after a failed attempt; it is re-dirtied
-     * when any net in its blocker set is successfully routed (because that frees
-     * up space on the path).
+     * Dirty flag: true if the routing environment for this net may have
+     * changed since its last failure. All nets start dirty (we have no
+     * prior knowledge). A net is marked clean after a failed attempt; it is
+     * re-dirtied when any net in its blocker set is successfully rerouted
+     * or ripped up (because that frees up space on the path).
      */
     private final Map<Integer, Boolean> dirty = new HashMap<>();
 
-    /** Adaptive cost multiplier, ≥ 1.0. */
+    /** Adaptive cost multiplier, &ge; 1.0. */
     private final Map<Integer, Double> costMultiplier = new HashMap<>();
 
-    private final int baseRipupCost;
+    /** The pass number on which this net was last attempted (failed). */
+    private final Map<Integer, Integer> lastTriedPass = new HashMap<>();
 
-    private static final int MAX_CLAUSES_PER_NET = 16;
-    private static final int MAX_CLAUSE_SIZE = 8;
-
-    /*
-    Each clause is a set of net numbers that, when all routed as-is,
-    collectively block the key net.  Key = blocked net, value = list of
-    blocker-sets (each blocker-set is one learned clause).
+    /**
+     * Number of passes since this net's blocker set was last refreshed by a
+     * failure. Used to age out stale blocker information.
      */
-    private final Map<Integer, List<Set<Integer>>> learnedClauses = new HashMap<>();
+    private final Map<Integer, Integer> blockerAge = new HashMap<>();
+
+    private final int baseRipupCost;
 
     // Constructor
 
@@ -107,40 +145,36 @@ public class ConflictAwareRetryScheduler {
      * Records a routing failure for {@code netNo} with the supplied set of
      * blocking net numbers.
      *
-     * @param netNo       the net that failed to route
+     * @param netNo        the net that failed to route
      * @param blockingNets nets whose routed geometry blocked this net's path
+     * @param currentPass  the current autoroute pass number, used to bound
+     *                     how long this net can be skipped for
      */
-    public void recordFailure(int netNo, Set<Integer> blockingNets) {
+    public void recordFailure(int netNo, Set<Integer> blockingNets, int currentPass) {
         // Increment consecutive-failure counter.
         failureCount.merge(netNo, 1, Integer::sum);
+        int failures = failureCount.get(netNo);
 
         // Raise cost multiplier, but only after enough failures to be sure
         // this is a genuine structural conflict rather than a pass-ordering
-        // accident.  This prevents premature cost inflation on small boards.
-        int failures = failureCount.getOrDefault(netNo, 0); // already incremented above
+        // accident.
         double currentMultiplier = costMultiplier.getOrDefault(netNo, 1.0);
         double newMultiplier = currentMultiplier;
         if (failures >= MIN_FAILURES_BEFORE_ESCALATION) {
-            newMultiplier = Math.min(currentMultiplier + COST_GROWTH_PER_FAILURE,
-                                     MAX_COST_MULTIPLIER);
+            newMultiplier = Math.min(currentMultiplier * COST_GROWTH_FACTOR, MAX_COST_MULTIPLIER);
             costMultiplier.put(netNo, newMultiplier);
         }
 
         // Mark clean: we just attempted this net; retrying without any
-        // environmental change would yield the same result.
+        // environmental change would yield the same result (for at most
+        // MAX_SKIP_PASSES passes - see shouldSkip).
         dirty.put(netNo, false);
+        lastTriedPass.put(netNo, currentPass);
+        blockerAge.put(netNo, 0);
 
-        if (blockingNets == null || blockingNets.isEmpty()) {
-            // No explicit blocker information.  We still recorded the failure;
-            // the net stays non-dirty until something else changes.
-            blockers.put(netNo, Collections.emptySet());
-            return;
-        }
-
-        // Replace the previous blocker set.
+        // Remove this net from the dependents of its old blockers before
+        // recording the new set.
         Set<Integer> prevBlockers = blockers.getOrDefault(netNo, Collections.emptySet());
-
-        // Remove this net from the dependents of its old blockers.
         for (int oldBlocker : prevBlockers) {
             Set<Integer> deps = dependents.get(oldBlocker);
             if (deps != null) {
@@ -148,34 +182,42 @@ public class ConflictAwareRetryScheduler {
             }
         }
 
+        if (blockingNets == null || blockingNets.isEmpty()) {
+            // No explicit blocker information. We still recorded the
+            // failure; the net stays non-dirty until something else changes
+            // or it ages out / is force-retried.
+            blockers.put(netNo, Collections.emptySet());
+            FRLogger.debug("Retry scheduler: net " + netNo + " failed (failures=" + failures
+                    + ", multiplier=" + String.format("%.2f", newMultiplier)
+                    + ", no blocker info)");
+            return;
+        }
+
         Set<Integer> newBlockers = new HashSet<>(blockingNets);
         newBlockers.remove(netNo); // a net cannot block itself
         blockers.put(netNo, Collections.unmodifiableSet(newBlockers));
 
-        // Register this net as a dependent of each blocker.
         for (int blocker : newBlockers) {
             dependents.computeIfAbsent(blocker, k -> new HashSet<>()).add(netNo);
         }
 
-        learnClause(netNo, blockingNets);
-
-        FRLogger.debug("CDCL: net " + netNo + " failed (failures=" + failureCount.get(netNo)
+        FRLogger.debug("Retry scheduler: net " + netNo + " failed (failures=" + failures
                 + ", multiplier=" + String.format("%.2f", newMultiplier)
                 + ", blockers=" + newBlockers + ")");
     }
 
     /**
-     * Records a successful routing for {@code netNo}.
-     * Marks all nets that were waiting on this net as dirty (they should be
-     * retried because space has been freed / a blocker has been resolved).
+     * Records a successful routing for {@code netNo}. Marks all nets that
+     * were waiting on this net as dirty, since space has been freed / a
+     * blocker has been resolved.
      *
      * @param netNo the net that was successfully routed
      */
     public void recordSuccess(int netNo) {
-        // Reset failure counter.
         failureCount.remove(netNo);
+        lastTriedPass.remove(netNo);
+        blockerAge.remove(netNo);
 
-        // Decay cost multiplier toward 1.0.
         double currentMultiplier = costMultiplier.getOrDefault(netNo, 1.0);
         double decayed = 1.0 + (currentMultiplier - 1.0) * DECAY_ON_SUCCESS;
         if (decayed < 1.01) {
@@ -184,15 +226,30 @@ public class ConflictAwareRetryScheduler {
             costMultiplier.put(netNo, decayed);
         }
 
-        invalidateClausesContaining(netNo);
+        dirtyDependents(netNo);
+    }
 
-        // This net no longer blocks anything; remove it as a blocker for all
-        // dependents.  The dependents are now re-dirtied.
+    /**
+     * Records that {@code netNo} was ripped up (its routed geometry removed
+     * from the board) regardless of whether it has yet been successfully
+     * rerouted. The board topology has already changed at this point, so
+     * dependents need to be re-examined even before {@code netNo} succeeds -
+     * waiting for {@link #recordSuccess} alone leaves dependents thinking
+     * the (now-removed) geometry is still in their way.
+     *
+     * @param netNo the net that was ripped up
+     */
+    public void recordRipped(int netNo) {
+        dirtyDependents(netNo);
+    }
+
+    private void dirtyDependents(int netNo) {
+        // This net no longer blocks anything in its current form; remove it
+        // as a blocker for all dependents and re-dirty them.
         Set<Integer> deps = dependents.remove(netNo);
         if (deps != null && !deps.isEmpty()) {
             for (int dep : deps) {
                 dirty.put(dep, true);
-                // Also update the blocker set of the dependent.
                 Set<Integer> depBlockers = blockers.get(dep);
                 if (depBlockers != null && !depBlockers.isEmpty()) {
                     Set<Integer> updatedBlockers = new HashSet<>(depBlockers);
@@ -200,95 +257,82 @@ public class ConflictAwareRetryScheduler {
                     blockers.put(dep, Collections.unmodifiableSet(updatedBlockers));
                 }
             }
-            FRLogger.debug("CDCL: net " + netNo + " succeeded, woke dependents=" + deps);
         }
-
-        // Also dirty this net itself so a fresh attempt is made if it ever
-        // fails again in a later pass.
-        dirty.remove(netNo);
-        // Clear its own blocker record — it is now routed.
-        blockers.remove(netNo);
     }
 
     /**
-     * Returns {@code true} if the net should be skipped on this pass because
-     * its routing environment has not changed since the last failed attempt.
+     * Returns true if routing should be skipped for {@code netNo} on this
+     * pass. A net is only skipped when it has failed before, its blocker
+     * set is non-empty and unchanged (not dirty), <em>and</em> it has been
+     * attempted within the last {@link #MAX_SKIP_PASSES} passes. That last
+     * condition guarantees no net can be skipped indefinitely, even if its
+     * blocker set genuinely never changes.
      *
-     * <p>A net is skipped only when:
-     * <ol>
-     *   <li>It has failed at least once ({@link #failureCount} &gt; 0), AND</li>
-     *   <li>It has a known non-empty blocker set (i.e. we know <em>why</em> it
-     *       failed), AND</li>
-     *   <li>It is not dirty (none of its blockers have been resolved since the
-     *       last attempt).</li>
-     * </ol>
-     *
-     * @param netNo the net to evaluate
+     * @param netNo       the net to evaluate
+     * @param currentPass the current autoroute pass number
      * @return true if routing should be skipped for this net on this pass
      */
-    public boolean shouldSkip(int netNo) {
+    public boolean shouldSkip(int netNo, int currentPass) {
         if (failureCount.getOrDefault(netNo, 0) == 0) {
-            return false; // Never failed — always attempt.
+            return false; // Never failed - always attempt.
         }
-        Set<Integer> myBlockers = blockers.getOrDefault(netNo, Collections.emptySet());
-        if (myBlockers.isEmpty()) {
-            // Blocker set is empty: either we never had blocker info, or all
-            // recorded blockers have since been successfully rerouted.  In
-            // either case the path may now be clear — always retry.
-            return false;
+        if (dirty.getOrDefault(netNo, true)) {
+            return false; // Environment may have changed - always attempt.
         }
-
-        // Only skip if every recorded blocker is still present (not dirty).
-        // A blocker is "still present" when it has never been successfully
-        // rerouted since the last failure, i.e. dirty[blocker] == false.
-        // If *any* blocker was rerouted (dirty == true or absent from dirty
-        // map) the environment changed and we must retry.
-        for (int blocker : myBlockers) {
-            if (dirty.getOrDefault(blocker, true)) {
-                // This blocker's environment changed — net may now route.
-                return false;
-            }
+        int lastTried = lastTriedPass.getOrDefault(netNo, currentPass);
+        if (currentPass - lastTried >= MAX_SKIP_PASSES) {
+            return false; // Force periodic re-exploration.
         }
 
-        // All blockers are still in place.  Check learned clauses for an
-        // additional confirmation before skipping.
-        if (!clauseBlocksNet(netNo)) {
-            // No clause fires — we are not certain enough to skip.
-            // Fall back to the dirty flag on the net itself.
-            boolean isDirty = dirty.getOrDefault(netNo, true);
-            if (isDirty) return false;
-        }
-
-        FRLogger.debug("CDCL: skipping net " + netNo
-                + " (all blockers unchanged: " + myBlockers + ")");
+        FRLogger.debug("Retry scheduler: skipping net " + netNo
+                + " (blockers unchanged: " + getBlockers(netNo) + ")");
         return true;
+    }
+
+    /**
+     * Returns a scheduling priority for {@code netNo}: higher should be
+     * routed sooner. Intended to order the nets that {@link #shouldSkip}
+     * did <em>not</em> filter out for this pass - it is not a substitute
+     * for that gate, since routing everything every pass with no gate at
+     * all defeats the point of having a scheduler.
+     *
+     * @param netNo the net to score
+     * @return a priority score; higher routes first
+     */
+    public int priority(int netNo) {
+        int score = 0;
+        score += 4 * getDependents(netNo).size();
+        score += 2 * failureCount.getOrDefault(netNo, 0);
+        if (dirty.getOrDefault(netNo, true)) {
+            score += 10;
+        }
+        return score;
     }
 
     /**
      * Returns the adaptive ripup cost to use when routing {@code netNo}.
      * The cost rises with each consecutive failure, up to
-     * {@value #MAX_COST_MULTIPLIER}× the base cost, then falls back after
+     * {@value #MAX_COST_MULTIPLIER}x the base cost, then falls back after
      * success.
      *
-     * @param netNo      the net about to be routed
-     * @param passScale  the linear pass-based scaling factor already applied
-     *                   by the caller (typically {@code start_ripup_costs * pass_no})
+     * @param netNo     the net about to be routed
+     * @param passScale the linear pass-based scaling factor already applied
+     *                  by the caller (typically {@code start_ripup_costs * pass_no})
      * @return adjusted ripup cost
      */
     public int getRipupCost(int netNo, int passScale) {
         double multiplier = costMultiplier.getOrDefault(netNo, 1.0);
-        // passScale is the base; multiply adaptively on top of it.
         return (int) Math.round(passScale * multiplier);
     }
 
     /**
-     * Returns how many waiting nets would be unblocked if {@code netNo} were
-     * ripped.  This is informational only — do NOT feed this into
+     * Returns how many waiting nets would be unblocked if {@code netNo}
+     * were ripped. This is informational only - do NOT feed this into
      * {@code AutorouteControl.ripupCostModifier} or any per-net cost
-     * reduction.  Reducing ripup costs for high-dependency nets causes churn:
-     * the maze search rips previously stable routes, creating re-route cycles
-     * that inflate pass counts (observed: B6 6→18 passes, −23 score).
-     * Use this only for logging or offline analysis.
+     * reduction. Reducing ripup costs for high-dependency nets causes
+     * churn: the maze search rips previously stable routes, creating
+     * re-route cycles that inflate pass counts (observed: B6 6->18 passes,
+     * -23 score). Use this only for logging or offline analysis.
      */
     public int ripupUnblockScore(int netNo) {
         Set<Integer> deps = dependents.get(netNo);
@@ -296,7 +340,7 @@ public class ConflictAwareRetryScheduler {
     }
 
     /**
-     * Marks a net as dirty externally — call this when items on the board
+     * Marks a net as dirty externally - call this when items on the board
      * change in a way that is known to affect a net's routing path (e.g. a
      * neighbour was ripped up during another net's routing).
      *
@@ -330,7 +374,28 @@ public class ConflictAwareRetryScheduler {
     }
 
     /**
-     * Resets all state.  Call between passes when a full re-evaluation is
+     * Ages all recorded blocker sets by one pass, discarding any that have
+     * gone unrefreshed for more than {@link #BLOCKER_MAX_AGE} passes and
+     * re-dirtying their owning net. Call this once at the end of every
+     * routing pass.
+     */
+    public void nextPass() {
+        Iterator<Map.Entry<Integer, Integer>> it = blockerAge.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<Integer, Integer> e = it.next();
+            int age = e.getValue() + 1;
+            if (age > BLOCKER_MAX_AGE) {
+                blockers.remove(e.getKey());
+                dirty.put(e.getKey(), true);
+                it.remove();
+            } else {
+                e.setValue(age);
+            }
+        }
+    }
+
+    /**
+     * Resets all state. Call between passes when a full re-evaluation is
      * desired (e.g. after a board-history restore).
      */
     public void reset() {
@@ -339,7 +404,8 @@ public class ConflictAwareRetryScheduler {
         failureCount.clear();
         dirty.clear();
         costMultiplier.clear();
-        learnedClauses.clear();
+        lastTriedPass.clear();
+        blockerAge.clear();
     }
 
     /**
@@ -352,71 +418,5 @@ public class ConflictAwareRetryScheduler {
                 + ", nets_blocked=" + blockers.size()
                 + ", nets_dirty=" + dirty.values().stream().filter(v -> v).count()
                 + "}";
-    }
-
-    /**
-     * Learn a clause: net {@code blocked} cannot route while all nets in
-     * {@code activeBlockers} are routed in their current positions.
-     */
-    public void learnClause(int blocked, Set<Integer> activeBlockers) {
-        // Ignore empty or excessively large clauses.
-        if (activeBlockers.isEmpty() || activeBlockers.size() > MAX_CLAUSE_SIZE) {
-            return;
-        }
-
-        List<Set<Integer>> existing =
-                learnedClauses.computeIfAbsent(blocked, k -> new ArrayList<>());
-
-        Set<Integer> clause = new HashSet<>(activeBlockers);
-
-        // Existing clause is stronger so don't store.
-        for (Set<Integer> e : existing) {
-            if (clause.containsAll(e)) {
-                return;
-            }
-        }
-
-        // Remove weaker clauses subsumed by the new one.
-        existing.removeIf(e -> e.containsAll(clause));
-
-        // Bound memory usage.
-        while (existing.size() >= MAX_CLAUSES_PER_NET) {
-            // FIFO eviction
-//            existing.remove(0);
-            // Largest-first eviction
-            existing.remove(Collections.max(
-                    existing,
-                    Comparator.comparingInt(Set::size)
-            ));
-        }
-
-        existing.add(Collections.unmodifiableSet(clause));
-    }
-
-    /**
-     * Invalidate all clauses that mention {@code reroutedNet}.
-     * Call this inside recordSuccess.
-     */
-    private void invalidateClausesContaining(int reroutedNet) {
-        for (List<Set<Integer>> clauses : learnedClauses.values()) {
-            clauses.removeIf(clause -> clause.contains(reroutedNet));
-        }
-    }
-
-    /**
-     * Returns true if any learned clause for this net is fully satisfied
-     * (all blocker nets still routed and unchanged), meaning the net will
-     * fail again for certain.
-     */
-    public boolean clauseBlocksNet(int netNo) {
-        List<Set<Integer>> clauses = learnedClauses.get(netNo);
-        if (clauses == null || clauses.isEmpty()) return false;
-        for (Set<Integer> clause : clauses) {
-            // A clause fires if none of its members have been dirtied.
-            boolean allStillBlocking = clause.stream()
-                    .noneMatch(b -> dirty.getOrDefault(b, true));
-            if (allStillBlocking) return true;
-        }
-        return false;
     }
 }
